@@ -8,7 +8,7 @@ OSRS is the 2007-era version of RuneScape, maintained by Jagex as a separate gam
 
 The Edgeville Monastery is the canonical defence-pure training spot. Level 5 monks. They don't auto-aggro once you're past combat 10, they rarely land hits, they self-heal, and they're worth roughly 2.5k defence XP an hour. Going from 1 to 75 is about 480 hours of monk time. It's abysmal. It's also the most AFK training method in the game — stand in a corner, click occasionally, stare at the wall.
 
-OSRS logs you out after roughly five minutes without input. This app tells you when you're sixty seconds from being kicked, what level you're at, and what's coming. You can glance at your wrist while doing anything else.
+OSRS has two timers that matter here. While you're in active combat, auto-retaliate keeps your character swinging for up to 20 minutes. When that runs out you stop attacking back, and 5 minutes of true idle later the game logs you out. So one click at a monk buys you roughly 25 minutes of AFK before you need to act. This app buzzes your wrist when you're 60 seconds from logout, names the skill you're training and the level you're at, and gives you a snooze button. You can be anywhere in the house.
 
 ## Works for any combat pure
 
