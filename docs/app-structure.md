@@ -1,74 +1,72 @@
-# App structure — extraction plan
+# App structure — module contracts as built
 
-Status: **proposed**, pre-implementation. Companion to `architecture.md` §4 R1 ("App is a god-module candidate"). This doc converts that finding into concrete module boundaries before code lands.
+Status: **implemented**. Originally drafted as a pre-implementation extraction plan; preserved here as the contract reference for the modules that landed. The original spec (`raxol_monkwatcher.md`) is deleted — this is now the authoritative description of the responsibility split.
 
-## Goal
+## Goal (achieved)
 
-`App` should be a **thin TEA shell**: `init/1`, `update/2`, `view/2`, `dispatch/1`. Nothing else. Every other concern — model shape, session math, mood derivation, scroll cycling, command building, name picking, notification gating, view rendering — lives in a sibling module that takes pure inputs and returns pure outputs.
+`App` is a **thin GenServer shell**: `init/1`, `handle_cast({:dispatch, msg}, state)`, `handle_call(:view, _, state)`, `dispatch/1`. The only impure thing App does is read the wall clock (`now_fn.()`) per `:dispatch` / `:view` call and pass it to a pure updater. Everything below it is unit-testable without a process.
 
-When this is done, the only impure thing App does is read the wall clock once per update/view and call the (pure) updater. Everything below it is unit-testable without a process.
+## Where each responsibility lives
 
-## What the spec's App currently owns
+The original App carried ten distinct responsibilities. They are split as follows in the shipped code:
 
-Reading `raxol_monkwatcher.md` §"File: app.ex" carefully, App carries ~10 distinct responsibilities:
-
-1. **Model schema** — the giant nested map in `init/1`
-2. **Initial state construction** — including reading `priv/monk_names.txt` from disk
-3. **Dispatch routing** — 7 `update/2` branches (`:plugin_tick`, 3× `:game_event`, `:scroll`, `:feed`, `:snooze`)
-4. **StateMachine threading** — `apply_tick`, `check_thresholds`, transition on events
-5. **Player slice updates** — copying tick payload fields into `model.player`
-6. **Session updates** — kill count, kill history (with 50-cap), death count, level history
-7. **Pet mood derivation** — calling `Pet.derive_mood/2` after every relevant update
-8. **Scroll input handling** — accumulating `scroll_position`, threshold-cycling view mode, the `next_view/2` 8-clause helper
-9. **Notification command construction** — building `{:async, fn -> broadcast end}` tuples, milestone detection (`rem(kills, 100) == 0`), muting check (`muted_until_ms`)
-10. **View dispatch** — calls `View.render(model)`
-
-This is a god-module trajectory. The fix is mechanical: each numbered item maps to a named module with a tight API.
+1. **Model schema** — `Raxol.Monkwatcher.Model` struct
+2. **Initial state construction** — `Model.new(now)` (pet naming was dropped from scope; see ADR-0005)
+3. **Dispatch routing** — `App.handle_cast({:dispatch, msg}, state)` routes by struct/tuple shape to one `App.Updaters.*` function
+4. **StateMachine threading** — `App.Updaters.plugin_tick/2` calls `StateMachine.apply_tick` + `check_thresholds`
+5. **Player slice updates** — `Model.put_player/2` copies fields from a typed `%Tick{}`
+6. **Session updates** — `Session.record_kill/3`, `Session.record_death/1`; hit history capped at 50 by `Session.@kill_history_cap`
+7. **Pet mood derivation** — `App.Updaters.advance_pet/2` calls `Pet.derive_target_mood/2` + `Pet.tick_mood/3`
+8. **Scroll input handling** — `Fidget.scroll/2` owns the ±30 cycle threshold and the view cycle order
+9. **Notification command construction** — `Notifications.idle_alert_commands/3`, `milestone_commands/3`, `death_command/2`, `level_up_command/2`; envelopes built by `Commands.broadcast_alert/1`; muting check (`muted_until_ms`) lives inside `Notifications`
+10. **View dispatch** — `View.render(model, now)`
 
 ## Responsibility → module map
 
-| Responsibility (above)              | New module                              | Kind        |
+| Responsibility                      | Module                                  | Kind        |
 |-------------------------------------|-----------------------------------------|-------------|
 | 1. Model schema                     | `Raxol.Monkwatcher.Model`               | pure data   |
-| 2a. Initial state                   | `Model.new/2`                           | pure        |
-| 2b. Pet name pool                   | `Raxol.Monkwatcher.MonkNames`           | boot-loaded |
+| 2. Initial state                    | `Model.new/1`                           | pure        |
 | 3. Dispatch routing                 | `Raxol.Monkwatcher.App.Updaters`        | pure        |
 | 4. StateMachine threading           | `App.Updaters.plugin_tick/2` (uses `StateMachine`) | pure |
 | 5. Player slice updates             | `Model.put_player/2`                    | pure        |
 | 6. Session math                     | `Raxol.Monkwatcher.Session`             | pure        |
-| 7. Pet mood derivation              | `Raxol.Monkwatcher.Pet` (already pure)  | pure        |
-| 7b. Mood transition smoothing       | `Pet.tick_mood/3`                       | pure (new)  |
+| 7. Pet mood derivation              | `Raxol.Monkwatcher.Pet`                 | pure        |
+| 7b. Mood transition smoothing       | `Pet.tick_mood/3`                       | pure        |
 | 8. Scroll + view cycling            | `Raxol.Monkwatcher.Fidget`              | pure        |
 | 9a. Notification commands           | `Raxol.Monkwatcher.Notifications`       | pure        |
 | 9b. PubSub command builder          | `Raxol.Monkwatcher.Commands`            | pure        |
 | 9c. Topic name                      | `Raxol.Monkwatcher.Channels`            | pure        |
 | 10. View dispatch                   | `Raxol.Monkwatcher.View` (with `now`)   | pure        |
 | Plugin wire decoding                | `Raxol.Monkwatcher.Plugin.Codec`        | pure        |
+| Surface title derivation            | `Raxol.Monkwatcher.Activity`            | pure        |
 
-Three of these (`Channels`, `MonkNames`, `Plugin.Codec`) also address R3, R9, and the ADR-0002 version-field gap.
+`Channels` and `Plugin.Codec` also addressed R9 and isolated the JSON-shape contract respectively. The ADR-0002 protocol-version field was deferred.
 
 ## Proposed file tree
 
 ```
 lib/raxol/monkwatcher/
-├── application.ex                  # OTP app, supervisor, boots MonkNames
+├── application.ex                  # OTP app, supervisor, conditional surfaces
+├── activity.ex                     # region-or-skill title for surfaces
 ├── channels.ex                     # alerts/0 — topic constant
-├── monk_names.ex                   # load!/0, random/0 — persistent_term backed
-├── model.ex                        # Model struct + slice helpers
-├── state_machine.ex                # pure FSM (per spec)
-├── session.ex                      # session slice + derived stats
+├── model.ex                        # Model struct + put_player/2
+├── state_machine.ex                # pure FSM
+├── session.ex                      # session slice + hit recording
 ├── fidget.ex                       # scroll + view cycling
 ├── pet.ex                          # mood derivation + fullness/energy + smoothing
 ├── pet/
-│   └── frames.ex                   # ASCII art data (8 frames × 6 moods)
-├── notifications.ex                # commands_for/2, milestones, muting check
-├── commands.ex                     # broadcast command builders
+│   └── frames.ex                   # ASCII art data (placeholder frames)
+├── notifications.ex                # idle_alert / milestone / death / level_up commands; muting
+├── commands.ex                     # broadcast_alert/1 envelope
 ├── plugin/
 │   ├── bridge.ex                   # GenServer, UDS connect/reconnect
-│   └── codec.ex                    # decode line → typed message
-├── app.ex                          # TEA shell only
+│   └── codec.ex                    # decode line → %Tick{} | %Event{}
+├── app.ex                          # GenServer shell
 ├── app/
 │   └── updaters.ex                 # per-message pure updaters
+├── osrs/
+│   └── xp_table.ex                 # XP lookup helpers
 ├── view.ex                         # render dispatcher (model, now)
 ├── view/
 │   ├── components.ex               # bar, sparkline, formatters, tabs
@@ -81,7 +79,7 @@ lib/raxol/monkwatcher/
     └── watch.ex
 ```
 
-Renames from spec: `PluginBridge` -> `Plugin.Bridge`, `View` (was a single module) -> `View` + `View.Components` + subviews. Everything else keeps spec names.
+Renames during implementation: `PluginBridge` -> `Plugin.Bridge`, single `View` module -> `View` + `View.Components` + subviews.
 
 ## Module contracts
 
@@ -178,15 +176,15 @@ The heart of the extraction. Every branch of `update/2` is a pure function here:
 ```elixir
 defmodule Raxol.Monkwatcher.App.Updaters do
   # All return {model, [command]}
-  def plugin_tick(model, payload)
+  def plugin_tick(model, %Tick{} = tick)
   def monk_killed(model, data, now)
   def player_death(model, now)
-  def game_event(model, type, data, now)          # generic — sm.apply_event/4
   def scroll(model, delta)
-  def feed(model, now)
   def snooze(model, ms, now)
 end
 ```
+
+Level-up events are routed in `App` itself (a single `Notifications.level_up_command/2` call), not through Updaters — the event carries no model mutation.
 
 Each function:
 1. Calls the appropriate pure module (`StateMachine`, `Session`, `Fidget`, `Pet`)
@@ -235,26 +233,6 @@ end
 
 One file, two lines, removes a class of typo bugs across `App`, `Commands`, `Surfaces.Telegram`, `Surfaces.Watch`.
 
-### `Raxol.Monkwatcher.MonkNames`
-
-```elixir
-defmodule Raxol.Monkwatcher.MonkNames do
-  @persistent_key {__MODULE__, :names}
-
-  def load! do
-    path = Application.app_dir(:raxol_monkwatcher, "priv/monk_names.txt")
-    names = path |> File.read!() |> String.split("\n", trim: true)
-    :persistent_term.put(@persistent_key, names)
-  end
-
-  def random do
-    @persistent_key |> :persistent_term.get() |> Enum.random()
-  end
-end
-```
-
-Called from `Application.start/2` before children start. Fixes R3 and works under `mix release`.
-
 ### `Raxol.Monkwatcher.Plugin.Codec`
 
 ```elixir
@@ -264,7 +242,8 @@ defmodule Raxol.Monkwatcher.Plugin.Codec do
   defmodule Tick do
     @enforce_keys [:t, :tick]
     defstruct [:t, :tick, :is_monk, :anim, :hp, :max_hp,
-               :prayer, :max_prayer, :run_energy, :x, :y, :plane]
+               :prayer, :max_prayer, :run_energy, :x, :y, :plane,
+               :skill, :skill_xp, :skill_level]
     @type t :: %__MODULE__{...}
   end
 
@@ -328,54 +307,62 @@ end
 
 Subviews (`PetView`, `HistoryView`, `StatsView`, `SparklineView`) take `(model, now)` and return view trees. They import `Components` for shared widgets. No `System.system_time` calls inside views (fixes R2).
 
-## The slim App, after extraction
+## The slim App
 
 ```elixir
 defmodule Raxol.Monkwatcher.App do
-  use Raxol.Core.Runtime.Application
+  use GenServer
 
-  alias Raxol.Monkwatcher.{Model, MonkNames, View}
+  alias Raxol.Monkwatcher.{Channels, Model, Notifications, View}
   alias Raxol.Monkwatcher.App.Updaters
+  alias Raxol.Monkwatcher.Plugin.Codec.{Event, Tick}
+
+  def start_link(opts \\ []),
+    do: GenServer.start_link(__MODULE__, opts, name: Keyword.get(opts, :name, __MODULE__))
+
+  def dispatch(msg, name \\ __MODULE__), do: GenServer.cast(name, {:dispatch, msg})
+  def view(name \\ __MODULE__), do: GenServer.call(name, :view)
 
   @impl true
-  def init(_ctx) do
-    Model.new(now(), MonkNames.random())
+  def init(opts) do
+    now_fn = Keyword.get(opts, :now_fn, &default_now/0)
+    pubsub = Keyword.get(opts, :pubsub, Raxol.Monkwatcher.PubSub)
+    {:ok, %{model: Model.new(now_fn.()), pubsub: pubsub, now_fn: now_fn}}
   end
 
   @impl true
-  def update({:plugin_tick, payload}, model),
-    do: Updaters.plugin_tick(model, payload)
-
-  def update({:game_event, "monk_killed", data}, model),
-    do: Updaters.monk_killed(model, data, now())
-
-  def update({:game_event, "player_death", _}, model),
-    do: Updaters.player_death(model, now())
-
-  def update({:game_event, type, data}, model),
-    do: Updaters.game_event(model, type, data, now())
-
-  def update({:scroll, delta}, model),
-    do: Updaters.scroll(model, delta)
-
-  def update({:feed}, model),
-    do: Updaters.feed(model, now())
-
-  def update({:snooze, ms}, model),
-    do: Updaters.snooze(model, ms, now())
-
-  def update(_msg, model), do: {model, []}
+  def handle_cast({:dispatch, msg}, state) do
+    {new_model, commands} = apply_update(msg, state)
+    Enum.each(commands, &execute(&1, state.pubsub))
+    {:noreply, %{state | model: new_model}}
+  end
 
   @impl true
-  def view(model), do: View.render(model, now())
+  def handle_call(:view, _from, state),
+    do: {:reply, View.render(state.model, state.now_fn.()), state}
 
-  def dispatch(msg), do: GenServer.cast(__MODULE__, {:dispatch, msg})
+  defp apply_update(%Tick{} = tick, state), do: Updaters.plugin_tick(state.model, tick)
+  defp apply_update(%Event{type: "monk_killed", data: d, t: t}, state),
+    do: Updaters.monk_killed(state.model, d, t)
+  defp apply_update(%Event{type: "player_death", t: t}, state),
+    do: Updaters.player_death(state.model, t)
+  defp apply_update(%Event{type: "level_up", data: %{"skill" => s, "level" => l}}, state),
+    do: {state.model, [Notifications.level_up_command(parse_skill(s), l)]}
+  defp apply_update({:scroll, delta}, state), do: Updaters.scroll(state.model, delta)
+  defp apply_update({:snooze, ms}, state), do: Updaters.snooze(state.model, ms, state.now_fn.())
+  defp apply_update(_, state), do: {state.model, []}
 
-  defp now, do: System.system_time(:millisecond)
+  defp execute({:broadcast_alert, payload}, pubsub),
+    do: Phoenix.PubSub.broadcast(pubsub, Channels.alerts(), payload)
+  defp execute(_, _), do: :ok
+
+  defp default_now, do: System.system_time(:millisecond)
 end
 ```
 
-Forty lines, no logic, no constants, no `priv/` reads, no command construction. Anything that needs testing lives in a module App calls.
+(Skill-atom whitelist and `level_up` parsing elided — see `lib/raxol/monkwatcher/app.ex` for the full source.) The body holds no domain logic: routing by struct/tuple shape, then delegate. Anything that needs testing lives in a module App calls.
+
+The three injection points (`:now_fn`, `:pubsub`, `:name`) are what makes the GenServer testable without monkey-patching: tests pass a fixed-clock function and a private PubSub server, then assert on broadcasts with `Phoenix.PubSub.subscribe` + `assert_receive`.
 
 ## What stays in App (and why)
 
@@ -383,34 +370,36 @@ Forty lines, no logic, no constants, no `priv/` reads, no command construction. 
 - **The `now/0` helper.** A single read per update, threaded into every updater. Centralizing it here means time discipline is enforced by the type signature, not by convention.
 - **`dispatch/1`.** Public API for external callers (`Plugin.Bridge`, watch tap-back, Telegram callback queries). It belongs on the named process.
 
-## Deviations from the spec
+## Deviations from the original spec
 
-| Spec name                      | New name                          | Why                                                                  |
-|--------------------------------|-----------------------------------|----------------------------------------------------------------------|
-| `Raxol.Monkwatcher.PluginBridge` | `Raxol.Monkwatcher.Plugin.Bridge` | Makes room for `Plugin.Codec` as a sibling; matches the file layout. |
-| Single `View` module           | `View` + `View.Components`        | Shared widgets (bars, sparkline, formatters) used across all subviews. |
-| `Pet.derive_mood/2`            | `Pet.derive_target_mood/2` + `Pet.tick_mood/3` | The spec promises mood smoothing in prose; this is the API that delivers it. |
-| Pet name read in `App.init/1`  | `MonkNames.load!` at boot, `MonkNames.random/0` in init | Survives `mix release`; one disk read per process lifetime. |
-| Wire decode in `PluginBridge.handle_manager_info/2` | `Plugin.Codec.decode/1` | Isolates the schema + version check from the connection loop. |
+| Spec name                                            | Shipped name                                   | Why                                                                                 |
+|------------------------------------------------------|------------------------------------------------|-------------------------------------------------------------------------------------|
+| `Raxol.Monkwatcher.PluginBridge`                     | `Raxol.Monkwatcher.Plugin.Bridge`              | Makes room for `Plugin.Codec` as a sibling; matches the file layout.                |
+| Single `View` module                                 | `View` + `View.Components`                     | Shared widgets (bars, sparkline, formatters) used across all subviews.              |
+| `Pet.derive_mood/2`                                  | `Pet.derive_target_mood/2` + `Pet.tick_mood/3` | The spec promised mood smoothing in prose; this is the API that delivers it.        |
+| Random pet name on `App.init/1`                      | Dropped                                        | Pet naming was cut from scope (ADR-0005). `Model.new/1` takes only `now`.           |
+| Wire decode in `PluginBridge.handle_manager_info/2`  | `Plugin.Codec.decode/1`                        | Isolates the schema from the connection loop.                                       |
+| Raxol TEA runtime (`use Raxol.Core.Runtime.Application`) | Plain `GenServer`                          | `raxol` was never added as a dependency; routing-by-shape inside `handle_cast` covers it. |
 
-## Recommended extraction order
+## Build order, as it happened
 
-The dependencies between modules dictate the build order. None of this changes the spec's recommended product build order (RuneLite plugin -> bridge -> StateMachine -> Pet -> App -> Watch -> scroll -> Telegram); it refines the *implementation order within each step*.
+The implementation followed this dependency order. Recorded for posterity; future module additions should slot in at the appropriate layer.
 
-1. **`Channels`, `MonkNames`** — trivial, prerequisites for boot.
-2. **`StateMachine`** — already in the spec, pure, property-tested first.
+1. **`Channels`** — topic constant, no dependencies.
+2. **`StateMachine`** — pure FSM, property-tested first.
 3. **`Session`, `Fidget`, `Model`** — pure data layer, no dependencies on App.
 4. **`Pet` + `Pet.Frames`** — depends on `StateMachine` for idle time; pure.
-5. **`Plugin.Codec`** — pure; can be tested against recorded fixtures before `Plugin.Bridge` exists.
+5. **`Plugin.Codec`** — pure; tested against synthesized fixtures (no real plugin recordings yet).
 6. **`Commands`, `Notifications`** — depends on `Channels`, `Model`. Still pure.
 7. **`App.Updaters`** — composes everything above. Property tests on model invariants.
-8. **`View.Components`, subviews, `View`** — depends on `Model`, `Pet`, `Session`. Pure render.
-9. **`App`** — the TEA shell. Trivial once `Updaters` exists.
-10. **`Plugin.Bridge`** — connects `Plugin.Codec` to `App.dispatch/1`. GenServer.
-11. **`Application`** — wires the supervisor, boots `MonkNames`, conditionally adds surfaces.
-12. **`Surfaces.Watch`, `Surfaces.Telegram`** — subscribers; can be developed in either order, last.
+8. **`View.Components`, subviews, `View`** — depends on `Model`, `Pet`, `Session`. Pure render with `(model, now)`.
+9. **`Activity`** — pure title derivation for surfaces.
+10. **`App`** — the GenServer shell. Trivial once `Updaters` exists.
+11. **`Plugin.Bridge`** — connects `Plugin.Codec` to `App.dispatch/1`. GenServer with injected `dispatch_fn` for tests.
+12. **`Application`** — wires the supervisor, conditionally adds Plugin.Bridge and surfaces.
+13. **`Surfaces.Watch`, `Surfaces.Telegram`** — subscribers with pure formatting contracts and injected `send_fn`.
 
-The first nine items can be built and fully property-tested without ever starting a process. That's the win.
+Items 1-9 are fully property-tested without starting a process. That was the win.
 
 ## Pattern conformance notes
 

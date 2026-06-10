@@ -4,7 +4,7 @@ Date: 2026-06-09
 
 ## Status
 
-Proposed
+Accepted (2026-06-10). Implemented as `Raxol.Monkwatcher.Plugin.Bridge` (renamed from `PluginBridge`). The wire format has grown since this ADR was written — see `Plugin.Codec` for the authoritative `%Tick{}` shape (adds `skill`, `skillXp`, `skillLevel`, `maxHp`, `maxPrayer` on top of the fields listed below).
 
 ## Context
 
@@ -24,7 +24,7 @@ Wire format options: protobuf (schema overhead), MessagePack (smaller but needs 
 
 We will use a Unix Domain Socket at a path configured per environment (e.g., `~/.cache/raxol_monkwatcher/plugin.sock`). The wire format is newline-delimited JSON: one event per line, framed by `\n`, parsed with `Jason`.
 
-`PluginBridge` connects with `:gen_tcp.connect({:local, path}, 0, [:binary, active: :once, packet: :line])`. Either side may restart at any time; `PluginBridge` reconnects with exponential backoff (500ms doubling to 10s cap).
+`Plugin.Bridge` connects with `:gen_tcp.connect({:local, path}, 0, mode: :binary, active: :once, packet: :line)`. Either side may restart at any time; `Plugin.Bridge` reconnects with exponential backoff (500ms doubling to 10s cap).
 
 The plugin emits two shapes:
 
@@ -45,5 +45,5 @@ The plugin emits two shapes:
 
 - Same-host only. Cannot stream to Elixir on a different machine without a TCP proxy.
 - JSON is verbose. At one tick per 600ms with ~10 fields, this is ~50KB/min — irrelevant on local IPC.
-- The protocol is schemaless. A field rename in the plugin without a coordinated Elixir change goes undetected until runtime. Mitigation: include a `"v"` (protocol version) field in every message and reject unknown versions in `PluginBridge`.
+- The protocol is schemaless. A field rename in the plugin without a coordinated Elixir change goes undetected until runtime. Mitigation discussed but not adopted: the codec absorbs renames in one place (`Plugin.Codec.to_tick/1`), so version tagging was deferred until a plugin actually exists.
 - Windows support requires `AF_UNIX` named pipes; unverified on Erlang/OTP for Windows. Not a target platform.

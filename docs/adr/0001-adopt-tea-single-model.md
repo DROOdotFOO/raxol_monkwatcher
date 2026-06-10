@@ -4,11 +4,11 @@ Date: 2026-06-09
 
 ## Status
 
-Proposed
+Accepted (2026-06-10). The single-model intent landed; the runtime is a plain `GenServer` calling pure `App.Updaters.*` functions, not the Raxol TEA runtime described below — `raxol` is not a dependency. References to `App.view/1` and Raxol commands should be read as "the equivalent pure-function rendering and `{:broadcast_alert, payload}` commands in this codebase."
 
 ## Context
 
-The app projects one source of truth (an OSRS session and a derived pet) to three concurrent surfaces: terminal, Telegram, Apple Watch. Each surface must agree on what the user is looking at right now. The session is event-driven (RuneLite ticks, kills, deaths) and the model is small enough to keep entirely in memory.
+The app projects one source of truth (an OSRS session and a derived pet) to two concurrent surfaces: Telegram and Apple Watch. Each surface must agree on what the user is looking at right now. The session is event-driven (RuneLite ticks, kills, deaths) and the model is small enough to keep entirely in memory.
 
 The available alternatives:
 

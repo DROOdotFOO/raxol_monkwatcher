@@ -1,29 +1,40 @@
 # Architecture — raxol_monkwatcher
 
-Status: **proposed**, pre-implementation. The spec is `raxol_monkwatcher.md` at the repo root. This document validates the proposed structure, scores its dependencies, names its patterns and risks, and links to ADRs for load-bearing decisions.
+Status: **implemented**. The original design spec (`raxol_monkwatcher.md`) was deleted once the build landed; this document is now the source-of-truth for the module topology, dependency graph, and risk register. Load-bearing decisions live in `adr/`.
+
+Two structural drifts from the original spec to flag for readers: there is no terminal surface (only `Surfaces.Watch` and `Surfaces.Telegram`), and `App` is a plain `GenServer` calling pure `App.Updaters.*` functions — not a Raxol TEA runtime. `raxol` is not a dependency.
 
 ## 1. Module topology
 
 ### Process-bearing modules (supervised)
 
-| Module                                | Kind                | Role                                                     |
-|---------------------------------------|---------------------|----------------------------------------------------------|
-| `Raxol.Monkwatcher.Application`       | OTP application     | Boot, supervisor                                         |
-| `Raxol.Monkwatcher.PubSub`            | `Phoenix.PubSub`    | App -> Surfaces fan-out on topic `"alerts"`              |
-| `Raxol.Monkwatcher.App`               | TEA runtime         | Owns model, runs `update/2`, emits commands              |
-| `Raxol.Monkwatcher.PluginBridge`      | `GenServer` (UDS)   | Consumes RuneLite JSON, dispatches to App                |
-| `Raxol.Monkwatcher.Surfaces.Telegram` | `GenServer` (opt)   | Subscribes to `"alerts"`, edits a pinned message         |
-| `Raxol.Monkwatcher.Surfaces.Watch`    | `GenServer` (opt)   | Subscribes to `"alerts"`, pushes APNS via `raxol_watch`  |
+| Module                                | Kind                | Role                                                                      |
+|---------------------------------------|---------------------|---------------------------------------------------------------------------|
+| `Raxol.Monkwatcher.Application`       | OTP application     | Boot, supervisor                                                          |
+| `Raxol.Monkwatcher.PubSub`            | `Phoenix.PubSub`    | App -> Surfaces fan-out on topic `Channels.alerts()`                      |
+| `Raxol.Monkwatcher.App`               | `GenServer`         | Owns model, routes inbound by shape to `App.Updaters.*`, executes commands |
+| `Raxol.Monkwatcher.Plugin.Bridge`     | `GenServer` (UDS)   | Consumes RuneLite JSON, decodes via `Plugin.Codec`, dispatches to App     |
+| `Raxol.Monkwatcher.Surfaces.Telegram` | `GenServer` (opt)   | Subscribes to alerts, formats pinned-message text (no Telegex wiring yet) |
+| `Raxol.Monkwatcher.Surfaces.Watch`    | `GenServer` (opt)   | Subscribes to alerts, builds push notifications (no APNS adapter yet)     |
 
 ### Pure modules (no state, no processes)
 
-| Module                                  | Role                                                   |
-|-----------------------------------------|--------------------------------------------------------|
-| `Raxol.Monkwatcher.StateMachine`        | Pure FSM over plugin ticks. Threshold detection.       |
-| `Raxol.Monkwatcher.Pet`                 | Mood/fullness/energy derivation from model.            |
-| `Raxol.Monkwatcher.Pet.Frames`          | ASCII art data (8 frames × 6 moods).                   |
-| `Raxol.Monkwatcher.View`                | Render dispatcher (pet/history/stats/sparkline).       |
-| `Raxol.Monkwatcher.View.PetView` et al. | Per-view render functions.                             |
+| Module                                  | Role                                                                |
+|-----------------------------------------|---------------------------------------------------------------------|
+| `Raxol.Monkwatcher.Model`               | Struct + `put_player/2`. The shape App holds.                       |
+| `Raxol.Monkwatcher.StateMachine`        | Pure FSM over plugin ticks. Threshold detection.                    |
+| `Raxol.Monkwatcher.Session`             | Hit history, deaths, kill recording. Capped at 50 entries.          |
+| `Raxol.Monkwatcher.Fidget`              | Scroll position + view-cycle threshold logic.                       |
+| `Raxol.Monkwatcher.Pet`                 | Mood/fullness/energy derivation + transition smoothing.             |
+| `Raxol.Monkwatcher.Pet.Frames`          | ASCII art data per mood (currently placeholder frames).             |
+| `Raxol.Monkwatcher.Activity`            | Region-or-skill title for surface copy.                             |
+| `Raxol.Monkwatcher.Notifications`       | Pure alert command constructors with muting check.                  |
+| `Raxol.Monkwatcher.Commands`            | Command envelope builders (currently `{:broadcast_alert, payload}`).|
+| `Raxol.Monkwatcher.Channels`            | Topic name constants.                                               |
+| `Raxol.Monkwatcher.App.Updaters`        | Per-message pure updaters returning `{model, commands}`.            |
+| `Raxol.Monkwatcher.Plugin.Codec`        | Wire-format decode; isolates stringly-keyed JSON.                   |
+| `Raxol.Monkwatcher.View`                | Render dispatcher (pet/history/stats/sparkline).                    |
+| `Raxol.Monkwatcher.View.PetView` et al. | Per-view render functions, take `(model, now)`.                     |
 
 ### Supervision tree
 
@@ -32,7 +43,7 @@ graph TD
   S[Supervisor :one_for_one]
   S --> PS[Phoenix.PubSub]
   S --> A[App]
-  S --> PB[PluginBridge]
+  S --> PB[Plugin.Bridge?]
   S --> T[Surfaces.Telegram?]
   S --> W[Surfaces.Watch?]
   PS -.subscribed by.-> T
@@ -41,9 +52,9 @@ graph TD
   A -. broadcasts on alerts .-> PS
 ```
 
-Start order matters: PubSub before App before surfaces (surfaces subscribe in `init/1`). PluginBridge can start any time (reconnect loop). The spec gets this right.
+Start order matters: PubSub before App before surfaces (surfaces subscribe in `init/1`). Plugin.Bridge can start any time (reconnect loop) — it is only added to the child list when `:plugin_socket_path` is set in app env. Both surfaces are gated independently by `:watch_enabled` and `:telegram_enabled`.
 
-A crash of `App` loses the model — fresh pet, fresh name. This is consistent with the "no persistence" stance (ADR-0005) but should be a conscious choice rather than accidental.
+A crash of `App` loses the model — fresh hit count, fresh mood. This is consistent with ADR-0005.
 
 ## 2. Dependency inventory and coupling scores
 
@@ -51,23 +62,22 @@ Coupling scored on three axes (1-5 each) per the architect skill rubric: **F**re
 
 | Dependency                            | Type                | F | B | R | Score | Notes                                                                 |
 |---------------------------------------|---------------------|---|---|---|-------|-----------------------------------------------------------------------|
-| `raxol` (Core, View, BaseManager)     | in-process          | 5 | 5 | 5 | **15** | Framework, by design. Drives App, View, PluginBridge.                |
-| RuneLite UDS protocol                 | local-subprocess    | 5 | 1 | 5 | **11** | Wire format change = both sides rewritten. Mitigation: protocol version field. |
+| RuneLite UDS protocol                 | local-subprocess    | 5 | 1 | 5 | **11** | Wire format change = both sides rewritten. Mitigated by isolating decode in `Plugin.Codec`. |
 | `phoenix_pubsub`                      | in-process          | 5 | 3 | 2 | **10** | App↔Surfaces seam. Swappable for `Registry` + broadcast if needed.    |
-| `jason`                               | in-process          | 5 | 1 | 1 | **7**  | One call site in `PluginBridge`. Trivially swappable.                 |
-| `raxol_telegram` + `telegex`          | in-process + external | 1 | 1 | 4 | **6**  | Localized to one surface. Telegram Bot API as true-external.          |
-| `raxol_watch` (APNS)                  | in-process + external | 1 | 1 | 4 | **6**  | Localized to one surface.                                             |
+| `jason`                               | in-process          | 5 | 1 | 1 | **7**  | One call site in `Plugin.Codec`. Trivially swappable.                 |
+| Telegram Bot API (future)             | external HTTP       | 1 | 1 | 4 | **6**  | Will localize to `Surfaces.Telegram`. Not yet wired.                  |
+| APNS (future)                         | external HTTP       | 1 | 1 | 4 | **6**  | Will localize to `Surfaces.Watch`. Not yet wired.                     |
 | `stream_data`                         | in-process test     | - | - | - | -      | Test-only.                                                            |
-| `phoenix.pubsub` topic `"alerts"`     | internal (string)   | 5 | 4 | 3 | **12** | Stringly-typed channel name used by 3 modules. Worth a `@topic "alerts"` constant in a shared module. |
+| Topic name (`Channels.alerts/0`)      | internal            | 5 | 4 | 5 | **3**  | Resolved: every site goes through `Channels.alerts/0`; typo class eliminated. |
 
 ### Cycle check
 
-No circular module dependencies in the proposed graph:
+No circular module dependencies in the shipped graph:
 
 ```mermaid
 graph LR
   Application --> App
-  Application --> PluginBridge
+  Application --> PluginBridge[Plugin.Bridge]
   Application --> Telegram
   Application --> Watch
   PluginBridge --> App
@@ -90,80 +100,56 @@ graph LR
 
 ## 3. Pattern identification
 
-**Primary pattern: TEA (The Elm Architecture) inside OTP, with a hexagonal pure core.**
+**Primary pattern: TEA-shaped single model inside OTP, with a hexagonal pure core.**
 
-- **TEA layer**: `App` holds the single model. `update/2` is pure (over its branches). Effects are returned as commands the Raxol runtime executes asynchronously.
-- **Hexagonal core**: `StateMachine` and `Pet` are pure, framework-free, property-testable. All side-effecting adapters (`PluginBridge`, `Surfaces.*`) sit at the edges.
-- **Event-driven seam**: `Phoenix.PubSub` decouples App from surfaces. Surfaces are conditionally started — adding a new surface (e.g., a Discord one) means one new GenServer + one new supervisor child, zero changes to App.
+- **Routing layer**: `App` is a `GenServer` that holds the single model. Inbound messages are routed by struct/tuple shape to a pure `App.Updaters.*` function that returns `{model, commands}`. App executes the returned commands (currently only `{:broadcast_alert, payload}`) and stores the new model.
+- **Hexagonal core**: `StateMachine`, `Pet`, `Session`, `Fidget`, `Model`, `Notifications`, `Commands`, `Activity`, `Plugin.Codec`, and the `View.*` modules are pure, framework-free, property-testable. All side-effecting adapters (`Plugin.Bridge`, `Surfaces.*`) sit at the edges.
+- **Event-driven seam**: `Phoenix.PubSub` decouples App from surfaces. Surfaces are conditionally started — adding a new surface (e.g., a Discord one) means one new GenServer + one new gate in `Application.optional_surfaces/0`, zero changes to App.
 
 This is a sound choice for the problem shape: one source of truth, multiple synchronized projections, pluggable I/O. No reason to deviate.
 
-## 4. Risks and anti-pattern findings
+## 4. Risk register — what shipped and what's still open
 
-Ranked by severity. Each item lists the smell, the spec evidence, and a concrete mitigation.
+This section originally enumerated ten pre-implementation risks. Most were mitigated during the build; the rest were either deferred or dropped from scope. Recording the disposition here so future reviewers don't relitigate them.
 
-### R1. `App` is a god-module candidate — HIGH
+### Resolved during implementation
 
-The spec's `App` module owns: model schema, dispatch routing, StateMachine threading, Pet mood derivation, command construction, view scheduling, scroll-wheel handling with view-cycle threshold logic, milestone detection, notification muting, random pet-name selection. The `update/2` already has 6 message variants and will grow. The file as drafted is ~150 lines and isn't done.
+| #  | Concern                                                  | Resolution                                                                                                                       |
+|----|----------------------------------------------------------|----------------------------------------------------------------------------------------------------------------------------------|
+| R1 | `App` god-module trajectory                              | `App` is ~40 lines of routing; all state transitions live in pure `App.Updaters.*`. See `lib/raxol/monkwatcher/app/updaters.ex`. |
+| R2 | View impurity (in-render `System.system_time` reads)     | `View.render/2` takes `now`; all subviews take `(model, now)`. App reads the clock once per `:view` call.                       |
+| R4 | `PluginBridge` coupled to `Raxol.Core.Behaviours.BaseManager` | `Plugin.Bridge` is a plain `GenServer`. No Raxol behaviour, no version coupling.                                                |
+| R5 | Mood derivation with no smoothing                        | Implemented via `Pet.derive_target_mood/2` + `Pet.tick_mood/3` with `@transition_ticks = 8`. Pinned by ExUnit examples.         |
+| R7 | Broadcast inline in `App.update` blocking the GenServer  | Commands are plain `{:broadcast_alert, payload}` tuples executed in `App.handle_cast`. PubSub broadcasts are fire-and-forget; no `{:async, fn -> ... end}` envelope ended up being needed at this tick cadence. |
+| R9 | Stringly-typed PubSub topic                              | `Channels.alerts/0` is the only source. Every broadcast/subscribe site goes through it.                                          |
 
-**Mitigation**: extract `Raxol.Monkwatcher.App.Updaters` (pure, `update_plugin_tick/2`, `update_kill/2`, `update_scroll/2`, etc.) leaving `App.update/2` as a thin dispatch shell. Keep `init/1`, the dispatch helper, and command construction in `App`.
+### Dropped from scope
 
-### R2. View impurity — HIGH
+| #   | Original concern                                                          | Why it isn't a risk now                                                                                                                 |
+|-----|---------------------------------------------------------------------------|------------------------------------------------------------------------------------------------------------------------------------------|
+| R3  | `File.read!("priv/monk_names.txt")` in `App.init/1`                       | Pet naming was dropped. `Model.new/1` takes only `now`; no priv read, no `MonkNames` module.                                            |
+| R10 | Global `:raxol_watch` action dispatcher registration                      | No `raxol_watch` dependency. Watch tap-back routing will be wired when an APNS adapter lands; tracked there, not here.                  |
 
-`PetView.render/1` calls `System.system_time(:millisecond)` directly, and `header/1` calls it independently. Two reads of the wall clock in one render means displayed values can disagree by a millisecond. More importantly, views become non-deterministic and untestable as pure functions.
+### Still open
 
-**Mitigation**: `App.view/1` reads `now` once (from the latest tick's `payload["t"]`, falling back to `System.monotonic_time`), threads it into `View.render(model, now)`. All view modules take `now` as a second arg.
+#### R6. `@attack_animations` is a hardcoded `MapSet` in `StateMachine` — LOW
 
-### R3. `File.read!` inside `init/0` — MEDIUM
+`lib/raxol/monkwatcher/state_machine.ex` hardcodes the unarmed and melee animation IDs. Real-play replay tuning (the original motivation for moving this to config) is gated on a real RuneLite plugin existing. Once recorded fixtures are in `test/support/`, lifting this to `Application.get_env(:raxol_monkwatcher, :attack_animations, @default)` is a 3-line change. Until then, the recompile cost is theoretical.
 
-`random_monk_name/0` reads `priv/monk_names.txt` from CWD on every App init. Breaks under `mix release` (CWD is not the project root) and re-reads on every supervisor restart.
+#### R8. Shallow `View` dispatcher — INFO
 
-**Mitigation**: load once at Application boot via `Application.app_dir(:raxol_monkwatcher, "priv/monk_names.txt")`, cache in `:persistent_term` keyed by `{__MODULE__, :monk_names}`. App calls `Enum.random(:persistent_term.get(...))`.
+`View.render/2` `case`-dispatches to one of four view modules. Still shallow, still fine — don't grow logic in it; if rendering ever needs policy, deepen one level down.
 
-### R4. Coupling to `Raxol.Core.Behaviours.BaseManager` — MEDIUM
+#### NEW: No protocol version field on the wire
 
-`PluginBridge` uses a Raxol-internal behaviour (`init_manager`, `handle_manager_info`). If Raxol changes the callback shape between versions, this module breaks invisibly until runtime.
-
-**Mitigation**: write `PluginBridge` as a plain `GenServer`. It's a 50-line module; the behaviour buys little and adds version coupling.
-
-### R5. Mood derivation runs on every event — LOW
-
-`Pet.derive_mood/2` is called on every plugin tick *and* every `monk_killed` event. At one tick per ~600ms plus rapid kills, that's >2 calls/sec. The function is pure and cheap, but the spec promises "5-10 tick mood smoothing" that no code enforces.
-
-**Mitigation**: store the *target* mood in the model and only animate the transition over N ticks. `Pet.tick_mood(model, now)` returns the displayed mood; `Pet.derive_target_mood/2` returns where it's heading. View renders displayed mood.
-
-### R6. `@attack_animations` is hardcoded — LOW
-
-Spec admits "extend as discovered". Hardcoding it means every tuning iteration during real-play replay needs a recompile.
-
-**Mitigation**: `Application.get_env(:raxol_monkwatcher, :attack_animations, @default_attack_animations)`, override in `config/runtime.exs` or via an env var.
-
-### R7. Fire-and-forget `GenServer.cast` for dispatch — LOW
-
-`App.dispatch/1` is `GenServer.cast`. At ~600ms tick cadence the mailbox stays shallow, but a slow PubSub broadcast inside `App.update` would queue ticks. Commands are already wrapped in `{:async, fn -> ... end}` — verify the Raxol runtime executes them in a separate task, otherwise broadcasts block the App process.
-
-**Mitigation**: confirm Raxol async command semantics. If commands run inline, switch `Phoenix.PubSub.broadcast/3` to `broadcast_from!/4` or move it behind a Task.
-
-### R8. Shallow `View` dispatcher — INFO
-
-`View.render/1` likely just `case`-dispatches to one of four view modules. Shallow but fine — don't grow logic in it; if rendering needs policy, deepen one level down.
-
-### R9. Stringly-typed PubSub topic — INFO
-
-`"alerts"` appears literally in `App`, `Surfaces.Telegram`, `Surfaces.Watch`. One typo = silent drop.
-
-**Mitigation**: `@alerts_topic "alerts"` in a `Raxol.Monkwatcher.Channels` module, or a function `alerts_topic/0`.
-
-### R10. Global `raxol_watch` action dispatcher registration — INFO
-
-`config :raxol_watch, action_dispatcher: Raxol.Monkwatcher.App` is global. Two Raxol apps in one node clash. Not a concern today but worth a comment.
+ADR-0002 mentioned adding `"v"` to every message. Not adopted — `Plugin.Codec.decode/1` accepts any object with `{"t", "tick"}` (tick) or `{"event", "data"}` (event) keys. A field rename in the plugin won't be caught until runtime. Tolerable until there is a real plugin in flight; revisit when one lands.
 
 ## 5. Data-flow diagram
 
 ```mermaid
 sequenceDiagram
   participant RL as RuneLite plugin
-  participant PB as PluginBridge
+  participant PB as Plugin.Bridge
   participant App as App (TEA)
   participant SM as StateMachine (pure)
   participant Pet as Pet (pure)
@@ -234,21 +220,19 @@ Order is significant: `:fainted` wins over everything, `:panicked` over `:sleepy
 
 | ADR                                                                       | Title                                                                   | Status   |
 |---------------------------------------------------------------------------|-------------------------------------------------------------------------|----------|
-| [0001](adr/0001-adopt-tea-single-model.md)                                | Adopt TEA single-model architecture for the app core                    | Proposed |
-| [0002](adr/0002-uds-newline-json-bridge.md)                               | Use Unix Domain Socket with newline-delimited JSON for RuneLite bridge  | Proposed |
-| [0003](adr/0003-pure-state-machine.md)                                    | Implement StateMachine as a pure module, not `gen_statem`               | Proposed |
-| [0004](adr/0004-pubsub-app-to-surfaces.md)                                | Use Phoenix.PubSub as the App-to-Surfaces seam                          | Proposed |
-| [0005](adr/0005-no-persistence.md)                                        | Do not persist session state across crashes or restarts                 | Proposed |
-| [0006](adr/0006-conditional-supervisor-surfaces.md)                       | Fan out surfaces via conditional supervisor children, not a registry    | Proposed |
+| [0001](adr/0001-adopt-tea-single-model.md)                                | Adopt TEA single-model architecture for the app core                    | Accepted |
+| [0002](adr/0002-uds-newline-json-bridge.md)                               | Use Unix Domain Socket with newline-delimited JSON for RuneLite bridge  | Accepted |
+| [0003](adr/0003-pure-state-machine.md)                                    | Implement StateMachine as a pure module, not `gen_statem`               | Accepted |
+| [0004](adr/0004-pubsub-app-to-surfaces.md)                                | Use Phoenix.PubSub as the App-to-Surfaces seam                          | Accepted |
+| [0005](adr/0005-no-persistence.md)                                        | Do not persist session state across crashes or restarts                 | Accepted |
+| [0006](adr/0006-conditional-supervisor-surfaces.md)                       | Fan out surfaces via conditional supervisor children, not a registry    | Accepted |
 
-## 9. Recommendations, ranked by impact
+## 9. Outstanding work
 
-1. **Before writing `App`, extract `App.Updaters`** (R1). Cheap now, expensive later.
-2. **Thread `now` through `view/1`** (R2). Sets the discipline before the views are written.
-3. **Load `monk_names` once at boot into `:persistent_term`** (R3). One-line fix; prevents a release-time surprise.
-4. **Move `@attack_animations` to runtime config** (R6). Enables the replay-tuning loop the spec depends on.
-5. **Use a plain `GenServer` for `PluginBridge`** (R4). Decouples from a Raxol-internal behaviour.
-6. **Add `Channels` module with `alerts_topic/0`** (R9). Prevents typo-induced silent drops across three modules.
-7. **Codify pet-mood ordering as an ExUnit test** (§7). Prevents accidental `cond` reordering from changing user-visible behavior.
+The structural recommendations from the original draft of this document all landed (extract `App.Updaters`, thread `now`, plain `GenServer` for `Plugin.Bridge`, `Channels.alerts/0`, pet-mood ordering pinned by tests). What remains is integration work, not structure:
 
-None of these block starting the build order in the spec. Items 1, 2, and 3 should be in place by the time `App` is written (step 5 of the build order). Items 4, 5, 6 by the time the surfaces are wired (steps 6-8).
+1. **A real RuneLite plugin.** The wire format documented in ADR-0002 + the `Plugin.Codec.Tick` struct. Until it exists, recorded fixtures from real play don't exist either.
+2. **APNS adapter for `Surfaces.Watch`.** The `send_fn` injection point is the seam — production wiring goes there.
+3. **Telegex hookup for `Surfaces.Telegram`.** Same `send_fn` story.
+4. **Pet ASCII frames in `Pet.Frames`.** Current contents are placeholders ("o.o", "x_x", etc.) — the contract is "list of strings per mood, rotation by index"; replace the strings.
+5. **Lift `@attack_animations` to `Application.get_env/3`** once real plugin sessions exist to tune against. Tracked as R6 in §4.

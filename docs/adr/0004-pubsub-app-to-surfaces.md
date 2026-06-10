@@ -4,13 +4,11 @@ Date: 2026-06-09
 
 ## Status
 
-Proposed
+Accepted (2026-06-10). Payload shapes evolved during implementation — the authoritative list is in the Decision section below.
 
 ## Context
 
-`App` (TEA) holds the authoritative model. Three surfaces (terminal, Telegram, Watch) project that model to their outputs. The terminal surface is a direct render of `App.view/1`; Telegram and Watch are GenServers that push to external systems.
-
-Two of the three surfaces are *optional* — they're behind chezmoi-style feature flags (`telegram_enabled`, `watch_enabled`). The seam between App and surfaces needs to support: zero, one, or two listeners; surfaces starting after App; surfaces crashing independently; no compile-time coupling.
+`App` holds the authoritative model. Two surfaces (Telegram, Watch) project that model to their outputs. Both are GenServers that push to external systems and are *optional* — they're behind feature flags (`telegram_enabled`, `watch_enabled`). The seam between App and surfaces needs to support: zero, one, or two listeners; surfaces starting after App; surfaces crashing independently; no compile-time coupling.
 
 Options:
 
@@ -23,13 +21,14 @@ The codebase has no other persistent need for a message bus — this is the only
 
 ## Decision
 
-We will use `Phoenix.PubSub` (started as `Raxol.Monkwatcher.PubSub` in the supervisor) with a single topic `"alerts"`. `App` broadcasts well-typed payloads:
+We use `Phoenix.PubSub` (started as `Raxol.Monkwatcher.PubSub` in the supervisor) with a single topic returned by `Channels.alerts/0` (`"alerts"`). `App` broadcasts well-typed payloads. The shipped shapes (built by `Notifications` via `Commands.broadcast_alert/1`):
 
-- `{:idle_alert, :warning | :critical, model}`
-- `{:milestone, :kills, integer}`
-- `{:pet_event, :fainted | :triumphant, model}`
+- `{:idle_alert, :warning | :critical, model, now}`
+- `{:milestone, :hits, integer, model, now}` (hits, not kills — the wire term is "hits" everywhere a user sees it)
+- `{:milestone, :level, {skill_atom, level_integer}}` (level-ups carry no model; surfaces format from the tuple)
+- `{:death, model, now}`
 
-Surfaces subscribe in their `init/1` and pattern-match in `handle_info/2`. The model is passed by value (a small map); surfaces extract what they need.
+Each payload includes `now` (the tick timestamp that triggered the event) so surfaces don't have to read the wall clock to format an idle string. Surfaces subscribe in their `init/1` and pattern-match in `handle_info/2`. The model is passed by value (a small map); surfaces extract what they need.
 
 To prevent typo-induced silent drops, the topic name is a function: `Raxol.Monkwatcher.Channels.alerts/0` returns `"alerts"`. All sites call the function.
 

@@ -4,7 +4,7 @@ Date: 2026-06-09
 
 ## Status
 
-Proposed
+Accepted (2026-06-10). Implemented as described in `lib/raxol/monkwatcher/state_machine.ex` with `StreamData` property tests in `test/raxol/monkwatcher/state_machine_test.exs`. The heartbeat-tick mitigation noted under "Negative" was not adopted — `App` advances the clock only via real plugin ticks; an extended Plugin.Bridge outage freezes the FSM until reconnect, which is acceptable behavior (the user is away from the bridge anyway).
 
 ## Context
 
@@ -38,5 +38,5 @@ We will implement `Raxol.Monkwatcher.StateMachine` as a pure module:
 
 **Negative**
 
-- The clock is driven externally. If `App` stops feeding ticks (e.g., PluginBridge dies and the reconnect window is long), the FSM "freezes" — `:idle` won't advance to `:warning` because no tick is checking the threshold. Mitigation: `App` schedules a self-tick (`Process.send_after(self(), :recheck_thresholds, 1000)`) as a heartbeat, even with no plugin data.
+- The clock is driven externally. If `App` stops feeding ticks (e.g., `Plugin.Bridge` dies and the reconnect window is long), the FSM "freezes" — `:idle` won't advance to `:warning` because no tick is checking the threshold. Mitigation discussed but not adopted: `App` could schedule a self-tick (`Process.send_after(self(), :recheck_thresholds, 1000)`) as a heartbeat. Deferred — a user with a dead bridge is already aware their session isn't being watched.
 - Loss of `gen_statem`'s built-in features (state enter/leave callbacks, postpone, generic timeouts). The FSM is simple enough that we don't need them; if we do later, the pure module can be wrapped by a `gen_statem` without changing the property tests.
